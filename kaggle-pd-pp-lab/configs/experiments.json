@@ -1,0 +1,60 @@
+{
+  "project": "kaggle-pd-pp-lab",
+  "model": {
+    "repo_id": "Qwen/Qwen2.5-1.5B-Instruct",
+    "revision": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+    "fallback_repo_id": "Qwen/Qwen2.5-0.5B-Instruct",
+    "served_name": "pdlab",
+    "num_layers": 28,
+    "num_kv_heads": 2,
+    "head_dim": 128,
+    "hidden_size": 1536
+  },
+  "vllm": {
+    "version": "0.8.5.post1",
+    "exclude_newer": "2025-05-20T00:00:00Z",
+    "python": "3.11",
+    "engine_env": {"VLLM_USE_V1": "0"},
+    "dtype": "float16",
+    "max_model_len": 2048,
+    "gpu_memory_utilization": 0.8,
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 8192,
+    "swap_space_gib": 1,
+    "enforce_eager": false,
+    "seed": 0,
+    "extra_args": []
+  },
+  "kv_transfer": {
+    "connector": "PyNcclConnector",
+    "kv_buffer_size": 1000000000,
+    "kv_port": 14579
+  },
+  "ports": {"proxy": 8000, "inst0": 8100, "inst1": 8200},
+  "workloads": {
+    "prefill_heavy": {"input_tokens": 1024, "output_tokens": 32, "num_requests": 40},
+    "decode_heavy": {"input_tokens": 128, "output_tokens": 256, "num_requests": 32}
+  },
+  "smoke": {"prefill_heavy_requests": 2, "decode_heavy_requests": 2, "decode_heavy_output_tokens": 32},
+  "concurrency_levels": [2, 8],
+  "warmup_requests": 4,
+  "max_reps": 3,
+  "arch_order": ["A", "C", "D", "B"],
+  "timeouts": {"server_start_s": 900, "request_s": 180, "run_s": 900, "stop_s": 90},
+  "budget": {
+    "total_session_hours_cap": 6.0,
+    "level_caps_min": {"P0": 60, "P1": 30, "P2": 60, "P3": 30},
+    "note": "Wall-clock from env_check (first cell) approximates GPU-session time, because Kaggle bills the whole session while the accelerator is attached."
+  },
+  "slo": {
+    "rule": "relative_to_A_c2",
+    "ttft_factor": 3.0,
+    "tpot_factor": 1.25,
+    "fallback_abs": {
+      "prefill_heavy": {"ttft_ms": 1000, "tpot_ms": 60},
+      "decode_heavy": {"ttft_ms": 300, "tpot_ms": 60}
+    },
+    "note": "Pre-registered before any measurement: per workload, TTFT SLO = 3.0 x A(single GPU) TTFT P50 at concurrency 2 and TPOT SLO = 1.25 x A TPOT P50 at concurrency 2. The absolute fallback is only used when A is missing."
+  },
+  "gpu_sample_interval_s": 0.5
+}

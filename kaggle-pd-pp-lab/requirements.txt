@@ -1,0 +1,12 @@
+# Isolated serving venv (created by scripts/install_or_check.py --step env, NOT installed into Kaggle's system Python):
+#   uv venv --python 3.11 /tmp/pdlab-venv
+#   uv pip install --python /tmp/pdlab-venv/bin/python vllm==0.8.5.post1 --exclude-newer 2025-05-20T00:00:00Z
+# --exclude-newer resolves every transitive dependency as of vLLM 0.8.5.post1's release, which pulls
+# torch 2.6.0 (CUDA 12.4 wheels), xformers 0.0.29.post2 (V0 attention backend on Turing/T4) and
+# transformers 4.51.x. The exact resolved set is written to results/env/venv_freeze.txt on each run.
+vllm==0.8.5.post1
+
+# Report generation runs on Kaggle's system Python and needs only:
+#   matplotlib   (preinstalled on Kaggle)
+# Client / proxy / mock server need:
+#   aiohttp      (a vLLM dependency inside the venv; also preinstalled in Kaggle's system Python)
