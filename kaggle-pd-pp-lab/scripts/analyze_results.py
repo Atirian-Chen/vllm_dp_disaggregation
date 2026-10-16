@@ -374,7 +374,7 @@ def report(cfg, runs, agg, slo, figs, include_mock):
         "A": ("1 个 vLLM 实例，CUDA_VISIBLE_DEVICES=0", "GPU0 完整模型，GPU1 空闲", "GPU0 本地分页 KV"),
         "B": ("2 个独立 vLLM 实例 + 轮询代理", "GPU0、GPU1 各一份完整模型", "各副本本地，请求级分发"),
         "C": ("1 个 vLLM 实例，--pipeline-parallel-size 2 --tensor-parallel-size 1，mp backend", "GPU0 前 14 层+embedding，GPU1 后 14 层+lm_head", "各 stage 保存自己层的 KV；层间传激活"),
-        "D": ("prefill 实例(kv_producer, GPU0) + decode 实例(kv_consumer, GPU1)，PyNcclConnector + PD 代理", "两卡各一份完整模型", "GPU0 prefill → PyNccl(NCCL) 发送 KV+hidden → GPU1 写入分页 KV 后继续 decode"),
+        "D": ("prefill 实例(kv_producer, GPU0) + decode 实例(kv_consumer, GPU1)，PyNcclConnector + PD 代理", "两卡各一份完整模型", "GPU0 prefill → PyNccl(NCCL) 发送 KV+hidden → GPU1 写入分页 KV 后继续 decode（含 PagedAttention 布局适配补丁，见局限性）"),
     }
     for a in ARCHS:
         s = smoke[a] or {}
@@ -474,6 +474,9 @@ def report(cfg, runs, agg, slo, figs, include_mock):
               "模型只有 1.5B 且是 GQA（2 个 KV 头），KV 体积很小，PD 传输成本被低估，PP/DP 的收益也被低估；",
               "PD 使用的是 vLLM V0 的 PyNcclConnector/SimpleConnector 参考实现：KV 以整请求为单位、prefill 完成后同步拉取，不与计算重叠，"
               "也传输了全部 token 的 hidden states；生产实现（V1 的 NIXL/P2P NCCL/LMCache，layer-wise 异步传输）开销模型不同；",
+              "vLLM 0.8.5 的 PD KV 辅助函数只支持 FlashAttention 的 KV 布局（读取会错位、写入报 IndexError），T4 的 XFormers 后端使用 PagedAttention 布局，"
+              "因此 D 组加载了一个小的布局适配补丁（scripts/pd_probe/pdlab_kv_layout.py：仅改 KV 从分页缓存读出/写回的索引方式，传输协议与请求匹配不变；"
+              "已用真实 vLLM 算子验证逐位一致，且 smoke 要求 D 的贪心输出与 A 一致）。这属于对框架的最小修改，生产实现不需要；",
               "关闭了 chunked prefill（SimpleConnector 的要求），统一应用到所有架构；开启 chunked prefill 的单卡混合部署会显著缓解 decode 被 prefill 打断的问题，结论不能外推；",
               "闭环负载、每配置 20–40 个请求、重复次数少，P95 的统计不确定性很大，只报告描述性统计，不声称统计显著或容量边界；",
               "Kaggle 是共享虚拟化环境，PCIe 拓扑、CPU 争用、nvidia-smi 采样粒度都会引入噪声；",

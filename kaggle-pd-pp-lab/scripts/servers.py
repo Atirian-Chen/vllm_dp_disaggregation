@@ -109,6 +109,9 @@ def build_specs(arch: str, cfg: dict, mock: bool = False, consumer_debug: bool =
             env["PDLAB_PROBE_LOG"] = str(probe_dir / f"{probe}.jsonl")
             if not mock:
                 env["PYTHONPATH"] = str(SCRIPTS_DIR / "pd_probe")
+                # vLLM 0.8.5's PD KV helper only handles the FlashAttention cache layout; T4 uses the
+                # XFormers/PagedAttention layout -> see scripts/pd_probe/pdlab_kv_layout.py
+                env["PDLAB_PAGED_KV_FIX"] = "1"
         return ProcSpec(name, cmd, env, str(LOG_DIR / f"server_{arch}_{name}.log"), f"http://127.0.0.1:{port}/health",
                         gpus=gpus, role=role, extra={"port": port, "probe_log": env.get("PDLAB_PROBE_LOG")})
 

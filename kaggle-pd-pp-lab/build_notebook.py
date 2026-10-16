@@ -11,7 +11,8 @@ LAB = "/kaggle/working/kaggle-pd-pp-lab"
 FILES = ["configs/experiments.json", "scripts/common.py", "scripts/env_check.py", "scripts/install_or_check.py",
          "scripts/prepare_workload.py", "scripts/client.py", "scripts/proxy.py", "scripts/evidence.py",
          "scripts/servers.py", "scripts/smoke_test.py", "scripts/run_experiments.py", "scripts/analyze_results.py",
-         "scripts/pd_probe/sitecustomize.py", "scripts/mock_vllm_server.py"]
+         "scripts/pd_probe/sitecustomize.py", "scripts/pd_probe/pdlab_kv_layout.py",
+         "scripts/mock_vllm_server.py"]
 
 cells = []
 
@@ -68,12 +69,13 @@ for f in FILES:
 
 md("""
 ### （可选）恢复上一次会话的结果
-如果之前的会话中断，可把下载的 `pdpp_results_*.zip` 作为 Kaggle Dataset 添加到本 Notebook（右侧 *Add Input*），
+如果之前的会话中断，可把下载的 `pdpp_results_*.zip` 或 `pdpp_partial_*.zip` 作为 Kaggle Dataset 添加到本 Notebook（右侧 *Add Input*），
 运行下面的单元格恢复已完成的配置，之后的步骤会自动跳过它们。
 """)
 code("""
 import zipfile
-zips = sorted(glob.glob("/kaggle/input/**/pdpp_results_*.zip", recursive=True))
+zips = sorted(glob.glob("/kaggle/input/**/pdpp_results_*.zip", recursive=True) +
+              glob.glob("/kaggle/input/**/pdpp_partial_*.zip", recursive=True))
 if zips and not glob.glob("results/runs/*.json"):
     with zipfile.ZipFile(zips[-1]) as z:
         members = [m for m in z.namelist() if m.startswith("results/") and "/state/" not in m]
@@ -147,7 +149,11 @@ md("""
 - `PD transfer: hits=8/8 bypass_false=0`：每个经代理的请求，decode 实例都从 prefill 实例收到了 KV，且 **没有重算 prefill**（vLLM 官方 `bypass_model_exec=True`）；
 - `bytes/token=28672`：与理论值 28 层×2×2 头×128×2B 一致；
 - 负对照（绕过 prefill 直接发给 decode）出现 `n_select_miss: 1, n_recv_bypass_false: 1`，说明探针能区分“真的传了”和“重算了”；
-- decode 日志里官方 DEBUG 行 `kv_ok` 计数 ≥ 8，`kv_fail` 只来自负对照。
+- decode 日志里官方 DEBUG 行 `kv_ok` 计数 ≥ 8，`kv_fail` 只来自负对照；
+- D 的贪心输出与 A 一致（`agreement with A` 全为 True）：证明传过去的 KV 内容正确，而不只是“传了字节”。
+
+注：vLLM 0.8.5 的 PD KV 辅助函数只支持 FlashAttention 的 KV 布局，T4 用的 XFormers 后端是 PagedAttention 布局，
+因此 D 的两个进程会自动加载布局适配补丁 `scripts/pd_probe/pdlab_kv_layout.py`（日志里可见 `kv_layout_patched`）。
 """)
 code("!{VPY} scripts/smoke_test.py --arch D")
 

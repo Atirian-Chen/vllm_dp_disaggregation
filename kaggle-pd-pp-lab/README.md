@@ -21,6 +21,8 @@
 > 本地验证中发现并已修复的两个问题：① 预热请求数少于并发数时，第一个满批次落在计时窗口内（现在预热数 = max(4, 并发)）；② vLLM 对文本为空的 token 也会发流式事件，只统计非空 chunk 会合并 ITL 间隔（现在每个 token 事件都计时）。
 >
 > 第一次 Kaggle 运行（2026-10-16）发现并已修复：四组服务启动时都报 `ModuleNotFoundError: No module named 'setuptools'`。T4 上 V0 使用 XFormers 后端，会导入 triton，而 triton 3.2 运行时 `import setuptools`；vLLM 0.8.5 只在 Python ≥ 3.12 时声明这个依赖，`uv venv` 也不会预装它（Ampere 及以上的卡走 FlashAttention，不经过这条路径，所以本地 4070 测试没暴露）。现在安装时显式装 setuptools，安装校验会实际导入 XFormers 后端并初始化 triton 的 CUDA driver；旧 venv 会被自动重新校验和修复。修复已在本地用 `VLLM_ATTENTION_BACKEND=XFORMERS` 强制走 T4 同一路径、真实启动 vLLM 验证通过。同一次运行中，可选的 CPU 干跑单元格在 GPU 会话里也被执行并因 `| head` 触发 BrokenPipe，现在该单元格默认关闭且检测到 GPU 时自动跳过。
+>
+> 第二次 Kaggle 运行（2026-10-16）：**A、B、C 的 smoke 与 12 个配置全部成功**（B、C 的贪心输出与 A 逐字一致；C 的两个 stage 各加载 1.67 GiB，单卡为 2.89 GiB，确认是层切分）。**D 失败**：第一个请求的 KV 确实传过去了（1024 token，K+V 29.4 MB = 28,672 B/token，112 ms），但 decode 端写入分页缓存时报 `IndexError: Dimension out of range`。原因是 vLLM 0.8.5 的 PD KV 辅助函数（`kv_connector/utils.py`）只支持 FlashAttention 的 KV 布局：读取用 `reshape(-1, heads, head_dim)`（在 PagedAttention 布局下会读到错位数据），写入用 `reshape_and_cache_flash`（直接报错）；T4 的 XFormers 后端用的是 PagedAttention 布局。修复：`scripts/pd_probe/pdlab_kv_layout.py` 只在 D 的进程中、只对 3 维的分页布局生效，按 slot 取 (block, offset) 读取，并用 XFormers 后端自己写缓存的 `ops.reshape_and_cache` 写回；PyNccl 传输、lookup buffer、请求匹配都不变。`tests/test_kv_layout_gpu.py` 在真实 GPU 上用 vLLM 自身算子验证：原实现读错位且写入复现同一个 IndexError，适配后读写逐位一致。另外 smoke D 新增硬性检查：D 的贪心输出必须与 A 一致（防止“传了字节但内容错了”）。
 
 ---
 
@@ -80,9 +82,11 @@ kaggle-pd-pp-lab/
 │   ├── smoke_test.py               # 每个架构的 smoke + 真实性检查
 │   ├── run_experiments.py          # 可续跑 benchmark
 │   ├── analyze_results.py          # summary.csv、图表、EXPERIMENT_REPORT.md、ZIP
-│   ├── pd_probe/sitecustomize.py   # PD KV 传输探针（只读包装，不改变行为）
+│   ├── pd_probe/sitecustomize.py   # PD KV 传输探针（只读包装，不改变行为）+ 布局补丁的加载钩子
+│   ├── pd_probe/pdlab_kv_layout.py # vLLM 0.8.5 PD KV 辅助函数的 PagedAttention(XFormers) 布局适配，仅 D 组加载
 │   └── mock_vllm_server.py         # 仅本地/CPU 干跑用的假服务器
-└── tests/test_local.py             # 本地单测（探针 import hook、指标）
+├── tests/test_local.py             # 本地单测（探针 import hook、指标）
+└── tests/test_kv_layout_gpu.py     # GPU 单测：用 vLLM 真实算子验证 KV 布局适配逐位正确
 ```
 
 ## 5. Kaggle 操作步骤（第一次使用也能照做）

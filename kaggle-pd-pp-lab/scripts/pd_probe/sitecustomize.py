@@ -12,12 +12,17 @@ $PDLAB_PROBE_LOG:
                         prefill forward pass and used the transferred KV/hidden states.
 
 Measurement cost: one torch.cuda.synchronize() per call so that timings include the GPU work.
+
+Separately, PDLAB_PAGED_KV_FIX=1 applies pdlab_kv_layout.patch to vLLM's KV helper so the
+reference PD connector works with the PagedAttention (XFormers, Turing) cache layout.
+That one DOES change behaviour (it is a functional fix) and is documented in the report.
 """
 import os
 
 _LOG = os.environ.get("PDLAB_PROBE_LOG")
+_KVFIX = os.environ.get("PDLAB_PAGED_KV_FIX") == "1"
 
-if _LOG:
+if _LOG or _KVFIX:
     import importlib.abc
     import importlib.util
     import json
@@ -25,10 +30,11 @@ if _LOG:
     import threading
     import time
 
-    _TARGET = "vllm.distributed.kv_transfer.kv_connector.simple_connector"
     _lock = threading.Lock()
 
     def _emit(rec):
+        if not _LOG:
+            return
         rec["ts"] = time.time()
         rec["pid"] = os.getpid()
         try:
@@ -123,12 +129,29 @@ if _LOG:
         cls.recv_kv_caches_and_hidden_states, cls.send_kv_caches_and_hidden_states = recv, send
         _emit({"ev": "patched", "module": mod.__name__})
 
+    def _patch_layout(mod):
+        import pdlab_kv_layout
+        pdlab_kv_layout.patch(mod)
+        _emit({"ev": "kv_layout_patched", "module": mod.__name__})
+
+    _TARGETS = {}
+    if _LOG:
+        _TARGETS["vllm.distributed.kv_transfer.kv_connector.simple_connector"] = _patch
+    if _KVFIX:
+        _TARGETS["vllm.distributed.kv_transfer.kv_connector.utils"] = _patch_layout
+
     class _Finder(importlib.abc.MetaPathFinder):
         def find_spec(self, fullname, path, target=None):
-            if fullname != _TARGET:
+            fn = _TARGETS.get(fullname)
+            if fn is None:
                 return None
-            sys.meta_path.remove(self)
-            spec = importlib.util.find_spec(fullname)
+            sys.meta_path.remove(self)  # avoid recursing into ourselves while resolving
+            try:
+                spec = importlib.util.find_spec(fullname)
+            finally:
+                _TARGETS.pop(fullname, None)
+                if _TARGETS:
+                    sys.meta_path.insert(0, self)
             if spec is None or spec.loader is None:
                 return spec
             orig_exec = spec.loader.exec_module
@@ -136,9 +159,9 @@ if _LOG:
             def exec_module(module):
                 orig_exec(module)
                 try:
-                    _patch(module)
+                    fn(module)
                 except Exception as e:  # never break the server because of the probe
-                    _emit({"ev": "patch_error", "error": repr(e)})
+                    _emit({"ev": "patch_error", "module": fullname, "error": repr(e)})
 
             spec.loader.exec_module = exec_module
             return spec

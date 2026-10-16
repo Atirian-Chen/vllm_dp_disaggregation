@@ -184,6 +184,14 @@ def main():
                 agree.append({"id": r["id"], "identical": a == b,
                               "common_prefix_chars": common_prefix_len(a, b), "len": len(b)})
             out["agreement_with_A"] = agree
+            if args.arch == "D" and not args.mock:
+                # corrupted / mis-laid-out KV still "transfers bytes" but yields different text:
+                # PD output must reproduce the single-GPU greedy output (B/C match A exactly on T4)
+                bad = [a for a in agree if a["common_prefix_chars"] < min(20, a["len"])]
+                if bad:
+                    fails.append(f"PD greedy outputs diverge from A (KV content wrong?): {bad}")
+        elif args.arch == "D" and not args.mock:
+            fails.append("A smoke result missing: cannot verify PD output correctness (run smoke A first)")
         out["checks_failed"] = fails
         out["status"] = "PASS" if not fails else "FAIL"
     except Exception as e:
