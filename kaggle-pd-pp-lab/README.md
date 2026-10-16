@@ -9,7 +9,7 @@
 | C | PP2 | 1 个 vLLM 实例，`--pipeline-parallel-size 2 --tensor-parallel-size 1`（mp backend） |
 | D | PD 分离 | prefill 实例（`kv_producer`，GPU0）+ decode 实例（`kv_consumer`，GPU1），vLLM 官方 `PyNcclConnector` 传输 KV，代理串联 |
 
-> **当前状态（诚实说明）**：代码、Notebook 和本地测试已完成；已在 Kaggle 双 T4 上跑过三次并据此修复了下文列出的问题（A/B/C 已全部跑通，D 的真实 KV 传输已验证）；完整报告需在 Kaggle 跑完全流程后由 `analyze_results.py` 自动生成 `EXPERIMENT_REPORT.md`，本仓库不附带任何未经运行的数字。
+> **当前状态（诚实说明）**：代码、Notebook 和本地测试已完成；第四次 Kaggle 运行已完整跑通（四组 smoke PASS，16/16 配置，每配置 1 次重复）；报告由 `analyze_results.py` 从 Kaggle 产出的 `results/` 自动生成，本仓库不附带任何未经运行的数字。建议时间充裕时补跑 rep 2、3（Notebook 第 9b 步）。
 >
 > 已在本地（不占 Kaggle 额度）验证过的部分：
 > - **安装链路（真实）**：WSL2 Ubuntu 中用 `install_or_check.py` 安装成功（约 100 s），解析结果为 vllm 0.8.5.post1、torch 2.6.0+cu124、xformers 0.0.29.post2、transformers 4.51.3、Python 3.11.17。
@@ -25,6 +25,8 @@
 > 第二次 Kaggle 运行（2026-10-16）：**A、B、C 的 smoke 与 12 个配置全部成功**（B、C 的贪心输出与 A 逐字一致；C 的两个 stage 各加载 1.67 GiB，单卡为 2.89 GiB，确认是层切分）。**D 失败**：第一个请求的 KV 确实传过去了（1024 token，K+V 29.4 MB = 28,672 B/token，112 ms），但 decode 端写入分页缓存时报 `IndexError: Dimension out of range`。原因是 vLLM 0.8.5 的 PD KV 辅助函数（`kv_connector/utils.py`）只支持 FlashAttention 的 KV 布局：读取用 `reshape(-1, heads, head_dim)`（在 PagedAttention 布局下会读到错位数据），写入用 `reshape_and_cache_flash`（直接报错）；T4 的 XFormers 后端用的是 PagedAttention 布局。修复：`scripts/pd_probe/pdlab_kv_layout.py` 只在 D 的进程中、只对 3 维的分页布局生效，按 slot 取 (block, offset) 读取，并用 XFormers 后端自己写缓存的 `ops.reshape_and_cache` 写回；PyNccl 传输、lookup buffer、请求匹配都不变。`tests/test_kv_layout_gpu.py` 在真实 GPU 上用 vLLM 自身算子验证：原实现读错位且写入复现同一个 IndexError，适配后读写逐位一致。另外 smoke D 新增硬性检查：D 的贪心输出必须与 A 一致（防止“传了字节但内容错了”）。
 
 > 第三次 Kaggle 运行（2026-10-16）：**D 的真实 KV 传输已完全工作**——经代理的 8 个请求 KV 命中 8/8、`bypass_model_exec=True` 6/6 批、`bypass_false=0`，28,672 B/token，传输中位数 9.9 ms，贪心输出与 A 4/4 逐字一致。唯一失败的是旧版负对照：它假设 decode 收到没 prefill 过的 prompt 会“未命中后本地重算”，但 vLLM 0.8.5 的 `SimpleBuffer.drop_select_handler` 会在 prefill 端一直等待匹配的 KV（没有未命中回复），于是请求挂到 180 s 超时，探针也没有记录（`select` 在返回后才记日志）。这恰恰说明 decode 不会退回重算。修复：探针在 `select` 开始时额外记 `select_begin`；负对照改为 30 s 超时，并要求“没有任何 token 输出 + 有一个等待中的 select + `bypass_false=0`”；mock 服务器同步模拟这一行为。
+
+> 第四次 Kaggle 运行（2026-10-16）：**四组 smoke 全部 PASS，16/16 个配置全部完成、所有请求成功**，整个会话约 20 分钟。D 的负对照按预期表现（30 s 内无输出、1 个等待中的 select、`bypass_false=0`）；正式 benchmark 中 D 的 144 个请求 KV 全部命中、decode 端重算 0 次。日志中的 Traceback 都是停服时 SIGTERM 触发的 `KeyboardInterrupt: MQLLMEngine terminated`，不是故障。根据这次数据修正了报告措辞：互联描述改为读取实测的 P2P 标志（这次是 True，原文写死了“Kaggle 通常无 P2P”）；PP2 的 TTFT 在 3/4 个配置低于单卡，补充了说明（标明是推测）；官方 DEBUG 行按批次计数的说明；简历句不再把两种输入长度的 KV 大小混在一起平均。
 
 ---
 

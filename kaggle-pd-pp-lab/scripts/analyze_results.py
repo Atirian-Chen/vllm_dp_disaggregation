@@ -259,7 +259,15 @@ def sgn(v, unit="%"):
     return "N/A" if v is None else f"{v:+.0f}{unit}"
 
 
-def mechanism_text(agg, cfg, cmp):
+def link_text(p2p) -> str:
+    if p2p is True:
+        return "PCIe（本次环境 torch 报告两卡可 P2P 直连；NCCL 实际选用的传输方式未记录）"
+    if p2p is False:
+        return "PCIe（本次环境两卡不能 P2P，经主机内存中转）"
+    return "PCIe（P2P 能力未测得）"
+
+
+def mechanism_text(agg, cfg, cmp, p2p=None):
     lo, hi = min(cfg["concurrency_levels"]), max(cfg["concurrency_levels"])
     T = []
 
@@ -277,6 +285,13 @@ def mechanism_text(agg, cfg, cmp):
                  "以及两个 stage 之间的同步/调度开销；vLLM V0 用 2 个 virtual engine 交错不同批次来填充流水线，只有同时有 ≥2 个批次在飞时才可能摊薄气泡。"
                  + ("本次实测中 PP2 的 TPOT 高于单卡的配置占多数，与上述开销一致。" if len(slower) > len(pp) / 2 else
                     "本次实测并未出现“PP2 普遍更慢”，与上述预期不一致；需要结合两卡利用率与更多重复来判断，样本有限，不做强结论。"))
+        lower_ttft = [x for x in pp if x[2] is not None and x[2] < -5]
+        if lower_ttft:
+            T.append(f"PP2 的 TTFT P50 低于单卡 5% 以上的配置 {len(lower_ttft)}/{len(pp)} 个（"
+                     + "、".join(f"{WL_CN[w]} c={c}" for w, c, _, _ in lower_ttft) + "）。这不代表单个请求的 prefill 变快了"
+                     "（每个 token 仍串行经过全部层）。可能的原因：闭环并发下请求常成对到达，单卡关闭 chunked prefill 时会把它们合并成一个更大的 prefill 批次，"
+                     "或让新请求的 prefill 排在正在进行的批次之后；PP2 的 2 个 virtual engine 则把请求分到不同批次，两个 prefill 可以在两个 stage 上错开重叠执行。"
+                     "这是推测，本实验没有逐 step 的调度日志来直接验证。")
     # DP2
     dp = [(w, c, get("B", w, c, "output_tok_per_s"), get("B", w, c, "ttft_p50_ms")) for w in cfg["workloads"] for c in cfg["concurrency_levels"] if ("B", w, c) in cmp]
     if dp:
@@ -329,7 +344,7 @@ def mechanism_text(agg, cfg, cmp):
                          f"（约 {fmt(p.get('effective_GBps'), 2)} GB/s），占 TTFT P50 约 {fmt(share * 100 if share is not None else None, 0)}%")
         T.append("**KV Cache 传输成本**：" + "；".join(parts) + "。理论值：Qwen2.5-1.5B 每 token KV = 28 层 × 2(K,V) × 2 KV 头 × 128 维 × 2 字节 = 28,672 字节，"
                  "1024 token ≈ 29.4 MB（另外 SimpleConnector 还传输全部 token 的 hidden states，约 3 KB/token）。GQA（2 个 KV 头）让这个模型的 KV 很小；"
-                 "对 MHA 或更大的模型、更长的输入，传输量成比例增长，而 T4 之间只有 PCIe（Kaggle 上通常无 P2P，经主机内存中转），传输占比会显著上升，"
+                 f"对 MHA 或更大的模型、更长的输入，传输量成比例增长，而 T4 之间只有 {link_text(p2p)}、没有 NVLink，传输占比会显著上升，"
                  "这就是 PD 收益可能被传输成本抵消的条件：输入很长、KV 头多、链路慢，而 decode 侧被 prefill 打断的代价又不大（低并发、短输入）。")
     return T
 
@@ -395,7 +410,7 @@ def report(cfg, runs, agg, slo, figs, include_mock):
         if a == "D" and s.get("extra"):
             p, c = s["extra"].get("pd_proxied", {}), s["extra"].get("pd_control", {})
             line += (f"；经代理的 {s['extra'].get('n_proxied_requests')} 个请求中 KV 命中 {p.get('n_select_hit')} 次、"
-                     f"decode 端重算 prefill {p.get('n_recv_bypass_false')} 次，官方 DEBUG 日志 'Successfully received all KVs' {ev.get('decode', {}).get('kv_success_count')} 次；"
+                     f"decode 端重算 prefill {p.get('n_recv_bypass_false')} 次，官方 DEBUG 日志 'Successfully received all KVs' {ev.get('decode', {}).get('kv_success_count')} 次（每个 decode 批次一条，一批可含多个请求）；"
                      f"负对照（未经 prefill 的 prompt 直接发给 decode）：{(s['extra'].get('control_request') or {}).get('timeout_s')} s 内"
                      f"{'有' if (s['extra'].get('control_request') or {}).get('ok') else '未'}返回输出、等待 KV 的 select {c.get('n_select_pending')} 个、"
                      f"decode 自行 prefill {c.get('n_recv_bypass_false')} 次（vLLM 0.8.5 的 lookup buffer 没有“未命中”回复，"
@@ -465,10 +480,10 @@ def report(cfg, runs, agg, slo, figs, include_mock):
         L.append(f"- {o}")
     L.append("")
     L.append("### 5.2 机制解释（措辞随实测方向自动选择；样本少，均为描述性结论）\n")
-    for t in mechanism_text(agg, cfg, comparison_lines(agg, cfg)):
+    for t in mechanism_text(agg, cfg, comparison_lines(agg, cfg), v.get("p2p_0_1")):
         L.append(t + "\n")
     L.append("**哪些差异来自硬件、哪些来自架构**：T4 FP16 算力（~65 TFLOPS 峰值）与 320 GB/s 显存带宽决定了单卡 prefill/decode 的绝对速度；"
-             "PCIe 互联（无 NVLink，Kaggle 上通常无 GPU P2P）决定了 PP 激活传输与 PD KV 传输的单位成本；1.5B 小模型使单卡远未饱和，削弱了 DP/PP 的意义。"
+             f"{link_text(v.get('p2p_0_1'))}、无 NVLink 的互联决定了 PP 激活传输与 PD KV 传输的单位成本；1.5B 小模型使单卡远未饱和，削弱了 DP/PP 的意义。"
              "架构本身的影响体现在：PP 让每个 token 串行经过两张卡；DP 只增加并发容量不缩短单请求；PD 用一次 KV 传输换取 prefill 与 decode 的隔离。\n")
 
     L.append("## 6. 局限性\n")
@@ -511,10 +526,13 @@ def report(cfg, runs, agg, slo, figs, include_mock):
         if "D" in ok_arch:
             d = [agg[k] for k in agg if k[0] == "D" and agg[k].get("pd")]
             if d:
-                kvmb = mean([x["pd"].get("kv_bytes_per_req_mean") for x in d])
-                xf = mean([x["pd"].get("transfer_ms_p50") for x in d])
+                ph = [x for k, x in agg.items() if k[0] == "D" and k[1] == "prefill_heavy" and x.get("pd")] or d
+                kvmb = mean([x["pd"].get("kv_bytes_per_req_mean") for x in ph])
+                xfs = [x["pd"].get("transfer_ms_p50") for x in ph if x["pd"].get("transfer_ms_p50") is not None]
+                xf_txt = (f"{fmt(min(xfs), 1)}–{fmt(max(xfs), 1)} ms" if len(xfs) > 1 else f"{fmt(xfs[0] if xfs else None, 1)} ms")
+                in_tok = cfg["workloads"]["prefill_heavy"].get("input_tokens", 1024) if ph is not d else None
                 L.append(f"- 基于 vLLM PyNcclConnector 部署真实 Prefill/Decode 分离（GPU0 prefill → NCCL 传输 KV → GPU1 decode），通过无侵入探针统计 KV 传输量与耗时"
-                         f"（实测每请求平均 {fmt((kvmb or 0) / 1e6, 1)} MB、传输中位数 {fmt(xf, 1)} ms），以 vLLM 官方 bypass_model_exec 标志、与单卡逐字一致的贪心输出、以及绕过 prefill 的负对照（decode 只等待 KV、不本地重算）验证 decode 端未重算 prefill。")
+                         f"（实测{f'输入 {in_tok} token 时' if in_tok else ''}每请求 KV {fmt((kvmb or 0) / 1e6, 1)} MB、传输中位数 {xf_txt}），以 vLLM 官方 bypass_model_exec 标志、与单卡逐字一致的贪心输出、以及绕过 prefill 的负对照（decode 只等待 KV、不本地重算）验证 decode 端未重算 prefill。")
         if "C" in ok_arch:
             L.append("- 通过日志与显存证据验证 PP2 的层切分（两个 stage 各加载约一半权重），结合 TTFT/TPOT 数据分析小模型在 PCIe 互联下流水线并行的通信与气泡开销。")
         L.append("（请把上面的数字与本报告表格核对后再使用；不要写入未在表中出现的提升百分比。）")

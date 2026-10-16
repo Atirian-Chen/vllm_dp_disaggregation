@@ -168,10 +168,10 @@ md("""
 code("!{VPY} scripts/run_experiments.py --archs A,C,D,B --reps 1")
 
 md("""
-### 9b.（可选，仅在时间充裕时）第二次重复
-只会补跑 rep 2（rep 1 跳过），约再用 30–40 分钟。先看第 2 步的预算状态再决定。
+### 9b.（建议，时间充裕时）补跑重复，降低 P95 的偶然性
+`--reps 3` 只补跑 rep 2、3（已完成的 rep 1 自动跳过）。第四次 Kaggle 运行中 4 个架构 × 16 个配置一轮约 13 分钟，两轮约 25–30 分钟。先看第 2 步的预算状态再决定。
 """)
-code("# !{VPY} scripts/run_experiments.py --archs A,C,D,B --reps 2")
+code("# !{VPY} scripts/run_experiments.py --archs A,C,D,B --reps 3")
 
 md("## 10. 汇总：报告、图表、ZIP")
 code("""
