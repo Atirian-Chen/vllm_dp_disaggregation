@@ -19,6 +19,8 @@
 > - **未能在本地验证**：PP2（C）与 PD 分离（D）需要两张 GPU、跨卡 NCCL，只能在 Kaggle 上第一次真正运行，这也是 smoke 中设置了自动真实性检查和 P1/P2 时间上限的原因。
 >
 > 本地验证中发现并已修复的两个问题：① 预热请求数少于并发数时，第一个满批次落在计时窗口内（现在预热数 = max(4, 并发)）；② vLLM 对文本为空的 token 也会发流式事件，只统计非空 chunk 会合并 ITL 间隔（现在每个 token 事件都计时）。
+>
+> 第一次 Kaggle 运行（2026-10-16）发现并已修复：四组服务启动时都报 `ModuleNotFoundError: No module named 'setuptools'`。T4 上 V0 使用 XFormers 后端，会导入 triton，而 triton 3.2 运行时 `import setuptools`；vLLM 0.8.5 只在 Python ≥ 3.12 时声明这个依赖，`uv venv` 也不会预装它（Ampere 及以上的卡走 FlashAttention，不经过这条路径，所以本地 4070 测试没暴露）。现在安装时显式装 setuptools，安装校验会实际导入 XFormers 后端并初始化 triton 的 CUDA driver；旧 venv 会被自动重新校验和修复。修复已在本地用 `VLLM_ATTENTION_BACKEND=XFORMERS` 强制走 T4 同一路径、真实启动 vLLM 验证通过。同一次运行中，可选的 CPU 干跑单元格在 GPU 会话里也被执行并因 `| head` 触发 BrokenPipe，现在该单元格默认关闭且检测到 GPU 时自动跳过。
 
 ---
 

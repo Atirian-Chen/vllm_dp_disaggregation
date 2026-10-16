@@ -85,16 +85,22 @@ else:
 
 md("""
 ### （可选）CPU 干跑：不消耗 GPU 额度验证 Notebook 流程
-在 **Accelerator = None** 的会话里也能运行：用假的 vLLM 服务器（mock）跑完 smoke → benchmark → 报告全流程，
-结果写到单独目录 `/kaggle/working/mock_results`，**不会**与真实结果混在一起，报告顶部会标注 MOCK。
-GPU 会话中请跳过此单元格。
+在 **Accelerator = None** 的会话里，把下面的 `RUN_MOCK_DRY_RUN` 改成 `True` 再运行：用假的 vLLM 服务器（mock）跑完
+smoke → benchmark → 报告全流程，结果写到单独目录 `/kaggle/working/mock_results`，不会与真实结果混在一起。
+默认 `False`，且检测到 GPU 时自动跳过，所以 GPU 会话中 “Save & Run All” 不会执行它。
 """)
 code("""
-MOCK_ENV = "PDLAB_RESULTS=/kaggle/working/mock_results"
-!{MOCK_ENV} python3 scripts/prepare_workload.py --mock-tokenizer
-!for a in A C D B; do {MOCK_ENV} python3 scripts/smoke_test.py --arch $$a --mock | head -3; done
-!{MOCK_ENV} python3 scripts/run_experiments.py --mock --archs A,D --workloads prefill_heavy --conc 2
-!{MOCK_ENV} python3 scripts/analyze_results.py --include-mock --no-zip | tail -2
+import shutil, subprocess
+RUN_MOCK_DRY_RUN = False
+has_gpu = shutil.which("nvidia-smi") is not None and subprocess.run(["nvidia-smi", "-L"], capture_output=True).returncode == 0
+if RUN_MOCK_DRY_RUN and not has_gpu:
+    MOCK_ENV = "PDLAB_RESULTS=/kaggle/working/mock_results"
+    !{MOCK_ENV} python3 scripts/prepare_workload.py --mock-tokenizer --force
+    !for a in A C D B; do {MOCK_ENV} python3 scripts/smoke_test.py --arch $$a --mock; done
+    !{MOCK_ENV} python3 scripts/run_experiments.py --mock --archs A,D --workloads prefill_heavy --conc 2
+    !{MOCK_ENV} python3 scripts/analyze_results.py --include-mock --no-zip
+else:
+    print("mock dry run skipped", "(GPU session)" if has_gpu else "(RUN_MOCK_DRY_RUN=False)")
 """)
 
 md("""
@@ -110,7 +116,9 @@ code("!python3 -c \"import sys; sys.path.insert(0, 'scripts'); from common impor
 md("""
 ## 3. 安装隔离的 vLLM 环境（P0，约 5–10 分钟，只需一次）
 在 `/tmp/pdlab-venv` 用 uv 安装 `vllm==0.8.5.post1`，所有依赖按 2025-05-20 的版本解析（不改动 Kaggle 系统 Python）。
-必须看到 `INSTALL_STEP env PASS`，且输出中 `devices` 为两张 cc `[7, 5]`、`xformers` 有版本号。
+必须看到 `INSTALL_STEP env PASS`，且输出中 `devices` 为两张 cc `[7, 5]`、`xformers` 有版本号、
+`xformers_backend_import` 为 `ok`、`triton_target` 不是 `FAILED`（这两项就是 T4 上 vLLM 启动时会走的导入路径）。
+如果之前的会话装过旧版 venv，本步骤会自动重新验证并修复。
 失败时日志在 `results/logs/install.log`。
 """)
 code("!python3 scripts/install_or_check.py --step env")

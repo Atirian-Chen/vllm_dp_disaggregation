@@ -143,6 +143,8 @@ def figures(agg, cfg, outdir: Path):
     made = []
 
     def grouped(metric, title, ylabel, fname, digits=0):
+        if not any(g.get(metric) is not None for g in agg.values()):
+            return  # nothing measured for this metric -> no empty chart
         fig, ax = plt.subplots(figsize=(8, 3.6), dpi=140)
         width = 0.19
         for i, a in enumerate(ARCHS):

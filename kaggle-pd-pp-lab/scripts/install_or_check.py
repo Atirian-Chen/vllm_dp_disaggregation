@@ -43,6 +43,19 @@ try:
 except Exception as e:
     info["xformers"] = "missing: " + repr(e)
 import sys; info["python"] = sys.version.split()[0]
+# The exact import path vLLM V0 takes on Turing: XFormers backend -> paged_attn -> prefix_prefill
+# -> triton, whose import needs setuptools and whose CUDA driver stub is compiled with gcc on
+# first use. Exercise it here so a broken env fails at install time, not at server start.
+try:
+    import vllm.attention.backends.xformers  # noqa: F401
+    info["xformers_backend_import"] = "ok"
+except Exception as e:
+    info["xformers_backend_import"] = "FAILED: " + repr(e)[:300]
+try:
+    from triton.runtime.driver import driver
+    info["triton_target"] = str(driver.active.get_current_target())
+except Exception as e:
+    info["triton_target"] = "FAILED: " + repr(e)[:300]
 print("VERIFY_JSON=" + json.dumps(info))
 """
 
@@ -79,6 +92,17 @@ def verify(py: str) -> dict:
     raise RuntimeError("verification failed:\n" + out[-3000:])
 
 
+def runtime_problems(info: dict) -> list[str]:
+    """Problems that would make every vLLM server crash at startup."""
+    p = []
+    if str(info.get("xformers", "")).startswith("missing"):
+        p.append("xformers missing: V0 on Turing needs the XFormers attention backend")
+    for k in ("xformers_backend_import", "triton_target"):
+        if str(info.get(k, "FAILED")).startswith("FAILED"):
+            p.append(f"{k}: {info.get(k, 'not checked')}")
+    return p
+
+
 def step_env(cfg: dict, args) -> dict:
     log = LOG_DIR / "install.log"
     venv = Path(args.venv)
@@ -87,8 +111,14 @@ def step_env(cfg: dict, args) -> dict:
     exclude = args.exclude_newer or cfg["vllm"]["exclude_newer"]
     prev = read_json(ENV_DIR / "install.json", {})
     if py.exists() and prev.get("ok") and prev.get("verify", {}).get("vllm") == version and not args.force:
-        print(f"venv already OK: vllm {version} at {venv} (skip). Use --force to reinstall.")
-        return prev
+        try:  # re-verify instead of trusting the old record (repairs envs from older versions of this script)
+            info = verify(str(py))
+            if not runtime_problems(info):
+                print(f"venv already OK: vllm {version} at {venv} (skip). Use --force to reinstall.")
+                return prev
+        except RuntimeError:
+            pass
+        print("existing venv failed re-verification -> repairing it")
     t0 = time.time()
     uv = ensure_uv(log)
     if not py.exists():
@@ -96,7 +126,9 @@ def step_env(cfg: dict, args) -> dict:
             print("uv could not provision Python", cfg["vllm"]["python"], "-> falling back to system python")
             if sh(uv + ["venv", "--python", sys.executable, str(venv)], log, 300) != 0:
                 raise RuntimeError("venv creation failed; see " + str(log))
-    rc = sh(uv + ["pip", "install", "--python", str(py), f"vllm=={version}", "--exclude-newer", exclude],
+    # setuptools: triton 3.2 imports it at runtime, but vLLM 0.8.5 only declares it for Python >= 3.12
+    # and `uv venv` (unlike `python -m venv`) does not seed it.
+    rc = sh(uv + ["pip", "install", "--python", str(py), f"vllm=={version}", "setuptools", "--exclude-newer", exclude],
             log, args.timeout)
     if rc != 0:
         raise RuntimeError(f"vllm install failed (rc={rc}); see {log}")
@@ -110,10 +142,9 @@ def step_env(cfg: dict, args) -> dict:
         problems.append("torch in venv does not see 2 CUDA devices")
     if any(d["cc"] != [7, 5] for d in info.get("devices", [])):
         problems.append(f"unexpected compute capability {info.get('devices')}")
-    if str(info.get("xformers", "")).startswith("missing"):
-        problems.append("xformers missing: V0 on Turing needs the XFormers attention backend")
+    problems += runtime_problems(info)
     res["problems"] = problems
-    res["ok"] = info.get("vllm") == version and not any("2 CUDA" in p for p in problems)
+    res["ok"] = info.get("vllm") == version and not any("2 CUDA" in p for p in problems) and not runtime_problems(info)
     write_json(ENV_DIR / "install.json", res)
     return res
 
