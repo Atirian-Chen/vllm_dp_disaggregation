@@ -9,13 +9,13 @@
 | C | PP2 | 1 个 vLLM 实例，`--pipeline-parallel-size 2 --tensor-parallel-size 1`（mp backend） |
 | D | PD 分离 | prefill 实例（`kv_producer`，GPU0）+ decode 实例（`kv_consumer`，GPU1），vLLM 官方 `PyNcclConnector` 传输 KV，代理串联 |
 
-> **当前状态（诚实说明）**：代码、Notebook 和本地测试已完成；**还没有在 Kaggle 双 T4 上运行过，因此目前没有任何 T4 性能数据**。真实结果需要你按下文步骤在 Kaggle 运行后，由 `analyze_results.py` 自动生成 `EXPERIMENT_REPORT.md`。
+> **当前状态（诚实说明）**：代码、Notebook 和本地测试已完成；已在 Kaggle 双 T4 上跑过三次并据此修复了下文列出的问题（A/B/C 已全部跑通，D 的真实 KV 传输已验证）；完整报告需在 Kaggle 跑完全流程后由 `analyze_results.py` 自动生成 `EXPERIMENT_REPORT.md`，本仓库不附带任何未经运行的数字。
 >
 > 已在本地（不占 Kaggle 额度）验证过的部分：
 > - **安装链路（真实）**：WSL2 Ubuntu 中用 `install_or_check.py` 安装成功（约 100 s），解析结果为 vllm 0.8.5.post1、torch 2.6.0+cu124、xformers 0.0.29.post2、transformers 4.51.3、Python 3.11.17。
 > - **单卡 A 组（真实 vLLM，RTX 4070 Laptop + Qwen2.5-0.5B，仅用于验证流程，不是实验数据）**：服务参数全部被 0.8.5 接受；日志证据解析正确（`engine=V0 0.8.5.post1 tp=1 pp=1`）；流式客户端在 4 个配置、32 个请求上 100% 成功，token 事件数 = 输出 token 数；顺序与并发两次贪心输出一致。
 > - **PD 探针（真实 vLLM 类）**：在 vLLM 0.8.5 的 `SimpleConnector` 上成功包装全部 4 个方法；命中/未命中/bypass/字节数逻辑由单测覆盖。
-> - **完整流程（mock）**：四组 smoke（含 PD 负对照）→ 32 个 benchmark 配置 → 断点续跑跳过 → 报告/图表/ZIP。
+> - **完整流程（mock）**：四组 smoke（含 PD 负对照：mock 也模拟了 0.8.5 lookup buffer 的“等待而不回未命中”）→ 32 个 benchmark 配置 → 断点续跑跳过 → 报告/图表/ZIP。
 > - **未能在本地验证**：PP2（C）与 PD 分离（D）需要两张 GPU、跨卡 NCCL，只能在 Kaggle 上第一次真正运行，这也是 smoke 中设置了自动真实性检查和 P1/P2 时间上限的原因。
 >
 > 本地验证中发现并已修复的两个问题：① 预热请求数少于并发数时，第一个满批次落在计时窗口内（现在预热数 = max(4, 并发)）；② vLLM 对文本为空的 token 也会发流式事件，只统计非空 chunk 会合并 ITL 间隔（现在每个 token 事件都计时）。
@@ -23,6 +23,8 @@
 > 第一次 Kaggle 运行（2026-10-16）发现并已修复：四组服务启动时都报 `ModuleNotFoundError: No module named 'setuptools'`。T4 上 V0 使用 XFormers 后端，会导入 triton，而 triton 3.2 运行时 `import setuptools`；vLLM 0.8.5 只在 Python ≥ 3.12 时声明这个依赖，`uv venv` 也不会预装它（Ampere 及以上的卡走 FlashAttention，不经过这条路径，所以本地 4070 测试没暴露）。现在安装时显式装 setuptools，安装校验会实际导入 XFormers 后端并初始化 triton 的 CUDA driver；旧 venv 会被自动重新校验和修复。修复已在本地用 `VLLM_ATTENTION_BACKEND=XFORMERS` 强制走 T4 同一路径、真实启动 vLLM 验证通过。同一次运行中，可选的 CPU 干跑单元格在 GPU 会话里也被执行并因 `| head` 触发 BrokenPipe，现在该单元格默认关闭且检测到 GPU 时自动跳过。
 >
 > 第二次 Kaggle 运行（2026-10-16）：**A、B、C 的 smoke 与 12 个配置全部成功**（B、C 的贪心输出与 A 逐字一致；C 的两个 stage 各加载 1.67 GiB，单卡为 2.89 GiB，确认是层切分）。**D 失败**：第一个请求的 KV 确实传过去了（1024 token，K+V 29.4 MB = 28,672 B/token，112 ms），但 decode 端写入分页缓存时报 `IndexError: Dimension out of range`。原因是 vLLM 0.8.5 的 PD KV 辅助函数（`kv_connector/utils.py`）只支持 FlashAttention 的 KV 布局：读取用 `reshape(-1, heads, head_dim)`（在 PagedAttention 布局下会读到错位数据），写入用 `reshape_and_cache_flash`（直接报错）；T4 的 XFormers 后端用的是 PagedAttention 布局。修复：`scripts/pd_probe/pdlab_kv_layout.py` 只在 D 的进程中、只对 3 维的分页布局生效，按 slot 取 (block, offset) 读取，并用 XFormers 后端自己写缓存的 `ops.reshape_and_cache` 写回；PyNccl 传输、lookup buffer、请求匹配都不变。`tests/test_kv_layout_gpu.py` 在真实 GPU 上用 vLLM 自身算子验证：原实现读错位且写入复现同一个 IndexError，适配后读写逐位一致。另外 smoke D 新增硬性检查：D 的贪心输出必须与 A 一致（防止“传了字节但内容错了”）。
+
+> 第三次 Kaggle 运行（2026-10-16）：**D 的真实 KV 传输已完全工作**——经代理的 8 个请求 KV 命中 8/8、`bypass_model_exec=True` 6/6 批、`bypass_false=0`，28,672 B/token，传输中位数 9.9 ms，贪心输出与 A 4/4 逐字一致。唯一失败的是旧版负对照：它假设 decode 收到没 prefill 过的 prompt 会“未命中后本地重算”，但 vLLM 0.8.5 的 `SimpleBuffer.drop_select_handler` 会在 prefill 端一直等待匹配的 KV（没有未命中回复），于是请求挂到 180 s 超时，探针也没有记录（`select` 在返回后才记日志）。这恰恰说明 decode 不会退回重算。修复：探针在 `select` 开始时额外记 `select_begin`；负对照改为 30 s 超时，并要求“没有任何 token 输出 + 有一个等待中的 select + `bypass_false=0`”；mock 服务器同步模拟这一行为。
 
 ---
 
@@ -49,7 +51,7 @@
 | A | 日志 `Initializing a V0 LLM engine (v0.8.5.post1)`、`pipeline_parallel_size=1`；GPU0 占显存、GPU1 空闲 |
 | B | 两个实例各有一次完整权重加载（`Model loading took ~2.9 GiB`），两张卡都占显存，代理确实把请求分到两个副本 |
 | C | `tensor_parallel_size=1, pipeline_parallel_size=2`；出现 **两条** `Model loading took X GiB`，每条都明显小于单卡（< 0.8×A 的权重量；每个 stage 约一半的层，外加各自一份 tied embedding / lm_head，约为单卡的 55–60%），证明是层切分而不是 TP2 或两个副本；两张卡都有显存 |
-| D | 两个实例都打印 `Initializing PyNcclConfig`；**无侵入探针**（`scripts/pd_probe/sitecustomize.py`，只在 D 的进程里通过 PYTHONPATH 加载）记录每次 `SimpleConnector.select` 收到的 K/V 字节数和耗时，以及官方 `bypass_model_exec` 标志：经代理的每个请求都必须 **命中 KV 且 bypass=True（decode 端没有重算 prefill）**；再做一次 **负对照**（绕过 prefill 直接请求 decode），必须出现未命中 + 重算，证明探针能区分两种情况。decode 日志中的官方 DEBUG 行 `Successfully received all KVs and hidden states, skip model forwarding` 也被计数 |
+| D | 两个实例都打印 `Initializing PyNcclConfig`；**无侵入探针**（`scripts/pd_probe/sitecustomize.py`，只在 D 的进程里通过 PYTHONPATH 加载）记录每次 `SimpleConnector.select` 收到的 K/V 字节数和耗时，以及官方 `bypass_model_exec` 标志：经代理的每个请求都必须 **命中 KV 且 bypass=True（decode 端没有重算 prefill）**；再做一次 **负对照**：把一个 prefill 端从没见过的 prompt 直接发给 decode。vLLM 0.8.5 的 `SimpleBuffer` 没有“未命中”回复（prefill 端的 `drop_select_handler` 会一直等到匹配的 KV 出现），所以 decode 必须 **停在 `select` 等待 KV（探针记录 `select_begin` 而无对应 `select`）、30 s 内不输出任何 token、`bypass_false=0`**；如果 decode 能自己算 prefill，就会很快返回结果，检查即失败。负对照会让 decode 永久阻塞，因此放在 smoke 最后，随后服务被停止，正式 benchmark 会重新启动 D。decode 日志中的官方 DEBUG 行 `Successfully received all KVs and hidden states, skip model forwarding` 也被计数 |
 
 另外每组都会和 A 的贪心输出比对（仅作合理性参考，FP16 下不同 kernel/批次允许少量差异），所有请求都必须 HTTP 200、`[DONE]`、usage 中 prompt/completion token 数等于预期、输出非空，否则记为失败而不是成功。
 
@@ -111,13 +113,13 @@ kaggle-pd-pp-lab/
 | 4 模型 + 负载 | `INSTALL_STEP model PASS`；`input lengths [1024]` / `[128]` | 网络问题重试一次；仍失败见 §7 |
 | 5 A smoke | `SMOKE A ... PASS`，`engine=V0 0.8.5.post1 tp=1 pp=1 attn=['XFormers']` | 见 §7 |
 | 6 C smoke | `SMOKE C ... PASS`，`tp=1 pp=2`，`weights_GiB` 两个值、各约为 A 的 55–60% | 见 §7；P1 上限 30 分钟 |
-| 7 D smoke | `SMOKE D ... PASS`，`hits=8/8 bypass_false=0 bytes/token=28672`，负对照 `n_select_miss: 1` | 见 §7；P2 上限 60 分钟 |
+| 7 D smoke | `SMOKE D ... PASS`，`hits=8/8 bypass_false=0 bytes/token=28672`，负对照 `answered=False token_events=0 select_pending=1 bypass_false=0` | 见 §7；P2 上限 60 分钟 |
 | 8 B smoke | `SMOKE B ... PASS`，`per_backend` 两个副本都有请求 | 见 §7 |
 | 9 benchmark | 每个配置一行 `ok 40/40 TTFT ... ITL ... tok/s`，D 组额外显示 `KV hits ... bypass_false 0` | 中断后直接重新运行本单元格，已完成的会跳过 |
 | 10 汇总 | 显示报告与 6 张图，打印 ZIP 路径 | – |
 | 11 结束 | 两张卡 `memory.used` 接近 0 | 再运行一次；仍不行就 *Stop Session* |
 
-**怎样确认真实 KV Transfer（第 7 步）**：看 `PD transfer:` 一行——`hits` 等于经代理的请求数、`bypass_false=0`（decode 没有重算 prefill）、`bytes/token=28672`（=28 层×2(K,V)×2 KV 头×128 维×2 字节）、有非零传输时间；负对照出现 miss 与重算。原始证据在 `results/logs/pd_probe/consumer.jsonl`、`results/logs/server_D_decode.log`（搜索 `Successfully received all KVs`）和 `results/smoke/D.json`。
+**怎样确认真实 KV Transfer（第 7 步）**：看 `PD transfer:` 一行——`hits` 等于经代理的请求数、`bypass_false=0`（decode 没有重算 prefill）、`bytes/token=28672`（=28 层×2(K,V)×2 KV 头×128 维×2 字节）、有非零传输时间；负对照未返回输出、`select_pending=1`、`bypass_false=0`（decode 只等 KV，不重算）。原始证据在 `results/logs/pd_probe/consumer.jsonl`、`results/logs/server_D_decode.log`（搜索 `Successfully received all KVs`）和 `results/smoke/D.json`。
 
 **查看与下载结果**：报告 `results/EXPERIMENT_REPORT.md` 会直接显示在第 10 步输出里；右侧 *Output* 面板（`/kaggle/working`）中下载 `pdpp_results_<时间>.zip`（包含 runs、smoke、日志、图表、报告、环境清单）。会话结束后 `/kaggle/working` 不保留，**一定要先下载 ZIP**（或用 *Save Version* 保存）。
 

@@ -6,7 +6,7 @@ every run made with --mock is tagged "mock": true and analyze_results.py refuses
 mix mock and real runs.
 
 Roles: mixed | producer | consumer. producer/consumer emulate the PD hand-off with a
-file registry so that the probe-log code paths (hit / miss) can be tested.
+file registry; like vLLM 0.8.5's SimpleBuffer, a consumer request whose KV never arrives waits forever.
 """
 from __future__ import annotations
 
@@ -47,14 +47,15 @@ def build(role: str, prefill_ms_per_tok: float, decode_ms: float):
         skip_prefill = False
         if role == "consumer":
             path = os.path.join(REG, k)
-            hit = os.path.exists(path)
+            probe({"ev": "select_begin", "n_tokens": n_in})
+            while not os.path.exists(path):  # like vLLM 0.8.5: wait for the producer, never "miss"
+                await asyncio.sleep(0.05)
             n = n_in * 28672
-            probe({"ev": "select", "hit": hit, "n_tokens": n_in, "ms": 2.0 if hit else 0.3,
-                   **({"matched_tokens": n_in, "bytes_k": n // 2, "bytes_v": n // 2, "bytes_hidden": n_in * 3072} if hit else {})})
-            probe({"ev": "recv_batch", "bypass_model_exec": hit, "n_reqs": 1, "n_tokens": n_in, "ms": 3.0 if hit else 0.5})
-            skip_prefill = hit
-            if hit:
-                os.remove(path)
+            probe({"ev": "select", "hit": True, "n_tokens": n_in, "ms": 2.0, "matched_tokens": n_in,
+                   "bytes_k": n // 2, "bytes_v": n // 2, "bytes_hidden": n_in * 3072})
+            probe({"ev": "recv_batch", "bypass_model_exec": True, "n_reqs": 1, "n_tokens": n_in, "ms": 3.0})
+            skip_prefill = True
+            os.remove(path)
         async with lock:
             if not skip_prefill:
                 await asyncio.sleep(n_in * prefill_ms_per_tok / 1000)

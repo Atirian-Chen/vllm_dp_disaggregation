@@ -148,8 +148,8 @@ md("""
 期望：
 - `PD transfer: hits=8/8 bypass_false=0`：每个经代理的请求，decode 实例都从 prefill 实例收到了 KV，且 **没有重算 prefill**（vLLM 官方 `bypass_model_exec=True`）；
 - `bytes/token=28672`：与理论值 28 层×2×2 头×128×2B 一致；
-- 负对照（绕过 prefill 直接发给 decode）出现 `n_select_miss: 1, n_recv_bypass_false: 1`，说明探针能区分“真的传了”和“重算了”；
-- decode 日志里官方 DEBUG 行 `kv_ok` 计数 ≥ 8，`kv_fail` 只来自负对照；
+- 负对照（prefill 端没见过的 prompt 直接发给 decode）：`answered=False token_events=0 select_pending=1 bypass_false=0`。vLLM 0.8.5 的 lookup buffer 没有“未命中”回复，decode 只能等 prefill 端的 KV、不会本地重算，所以 30 s 超时是**预期结果**（之后服务会被停止）；
+- decode 日志里官方 DEBUG 行 `kv_ok` 计数 ≥ 8，`kv_fail=0`；
 - D 的贪心输出与 A 一致（`agreement with A` 全为 True）：证明传过去的 KV 内容正确，而不只是“传了字节”。
 
 注：vLLM 0.8.5 的 PD KV 辅助函数只支持 FlashAttention 的 KV 布局，T4 用的 XFormers 后端是 PagedAttention 布局，

@@ -2,7 +2,7 @@
 
   python scripts/smoke_test.py --arch A      (P0)
   python scripts/smoke_test.py --arch C      (P1)  verifies real 2-stage pipeline
-  python scripts/smoke_test.py --arch D      (P2)  verifies real KV transfer + negative control
+  python scripts/smoke_test.py --arch D      (P2)  verifies real KV transfer + negative control (decode must not recompute)
   python scripts/smoke_test.py --arch B      (P3)  verifies two independent replicas
 
 Writes results/smoke/<arch>.json ; the benchmark runner only runs architectures whose
@@ -88,9 +88,16 @@ def check_arch(arch: str, ev: dict, gpu: list[dict], apps: list[dict], extra: di
             fails.append(f"{pd['n_recv_bypass_false']} decode prefill steps were recomputed instead of using received KV")
         if pd["kv_bytes_total"] <= 0:
             fails.append("no KV bytes received")
-        ctrl = extra["pd_control"]
-        if ctrl["n_select_miss"] < 1 or ctrl["n_recv_bypass_false"] < 1:
-            fails.append(f"negative control did not register a miss/recompute: {ctrl}")
+        # negative control: a prompt the producer never prefilled. vLLM 0.8.5's SimpleBuffer has no
+        # miss reply - the producer waits for matching KV - so the decode engine must stay blocked in
+        # select and produce nothing; if it fell back to computing the prefill itself it would answer.
+        ctrl, cr = extra["pd_control"], extra["control_request"]
+        if cr.get("ok") or (cr.get("output_tokens") or 0) > 0 or (cr.get("n_token_events") or 0) > 0:
+            fails.append(f"negative control: decode answered a never-prefilled prompt (local recompute?): {cr}")
+        if ctrl["n_recv_bypass_false"] != 0:
+            fails.append(f"negative control: decode ran its own prefill: {ctrl}")
+        if ctrl["n_select_pending"] < 1:
+            fails.append(f"negative control: decode never asked the producer for KV: {ctrl}")
     return fails
 
 
@@ -153,14 +160,19 @@ def main():
             cons_log = procs["decode"]["extra"]["probe_log"]
             extra["n_proxied_requests"] = len(seq) + len(conc)
             extra["pd_proxied"] = pd_probe_stats(prod_log, cons_log, t0, t1 + 1)
-            # negative control: bypass the proxy -> the producer never saw this prompt
+            # negative control (must be the LAST request: it leaves the decode engine blocked for good;
+            # the servers are stopped right after): bypass the proxy -> the producer never saw this prompt
             ctrl_item = dict(items[-1])
             ctrl_item["id"] = "control-no-prefill"
             ctrl_item["prompt_token_ids"] = list(reversed(ctrl_item["prompt_token_ids"]))
             t2 = time.time()
             decode_url = f"http://127.0.0.1:{cfg['ports']['inst1']}"
-            out["control_request"] = asyncio.run(run_one(decode_url, model, ctrl_item, timeout))
+            ctrl_timeout = cfg["smoke"].get("pd_control_timeout_s", 30)
+            out["control_request"] = asyncio.run(run_one(decode_url, model, ctrl_item, ctrl_timeout))
             time.sleep(0.5)
+            extra["control_request"] = {k: out["control_request"].get(k) for k in
+                                        ("ok", "http_status", "error", "output_tokens", "n_token_events", "e2e_ms")}
+            extra["control_request"]["timeout_s"] = ctrl_timeout
             extra["pd_control"] = pd_probe_stats(prod_log, cons_log, t2, time.time())
         time.sleep(1.0)
         ev = scan_server_logs(st, offs)
@@ -218,7 +230,10 @@ def main():
         print(f"  PD transfer: hits={p['n_select_hit']}/{out['extra']['n_proxied_requests']} bypass_false={p['n_recv_bypass_false']} "
               f"KV bytes/req={p['kv_bytes_per_req_mean']} bytes/token={p['kv_bytes_per_token']} transfer p50={p['transfer_ms_p50']} ms "
               f"~{p['effective_GBps']} GB/s")
-        print(f"  negative control (direct to decode): {out['extra']['pd_control']}")
+        c, cr = out["extra"]["pd_control"], out["extra"]["control_request"]
+        print(f"  negative control (direct to decode, never prefilled): answered={cr['ok']} token_events={cr['n_token_events']} "
+              f"[{cr['error']} after {cr['timeout_s']} s]  select_pending={c['n_select_pending']} "
+              f"bypass_false={c['n_recv_bypass_false']}  (expected: not answered, pending>=1, bypass_false=0)")
     if out.get("agreement_with_A"):
         print("  agreement with A:", [(a["id"], a["identical"]) for a in out["agreement_with_A"]])
     for f in out.get("checks_failed", []):

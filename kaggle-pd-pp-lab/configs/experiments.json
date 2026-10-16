@@ -35,7 +35,7 @@
     "prefill_heavy": {"input_tokens": 1024, "output_tokens": 32, "num_requests": 40},
     "decode_heavy": {"input_tokens": 128, "output_tokens": 256, "num_requests": 32}
   },
-  "smoke": {"prefill_heavy_requests": 2, "decode_heavy_requests": 2, "decode_heavy_output_tokens": 32},
+  "smoke": {"prefill_heavy_requests": 2, "decode_heavy_requests": 2, "decode_heavy_output_tokens": 32, "pd_control_timeout_s": 30},
   "concurrency_levels": [2, 8],
   "warmup_requests": 4,
   "max_reps": 3,

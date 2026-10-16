@@ -396,8 +396,10 @@ def report(cfg, runs, agg, slo, figs, include_mock):
             p, c = s["extra"].get("pd_proxied", {}), s["extra"].get("pd_control", {})
             line += (f"；经代理的 {s['extra'].get('n_proxied_requests')} 个请求中 KV 命中 {p.get('n_select_hit')} 次、"
                      f"decode 端重算 prefill {p.get('n_recv_bypass_false')} 次，官方 DEBUG 日志 'Successfully received all KVs' {ev.get('decode', {}).get('kv_success_count')} 次；"
-                     f"负对照（绕过 prefill 直接发给 decode）：未命中 {c.get('n_select_miss')}、重算 {c.get('n_recv_bypass_false')}，"
-                     f"官方 WARNING 'Failed to receive all KVs' {ev.get('decode', {}).get('kv_fail_count')} 次（应只来自负对照）")
+                     f"负对照（未经 prefill 的 prompt 直接发给 decode）：{(s['extra'].get('control_request') or {}).get('timeout_s')} s 内"
+                     f"{'有' if (s['extra'].get('control_request') or {}).get('ok') else '未'}返回输出、等待 KV 的 select {c.get('n_select_pending')} 个、"
+                     f"decode 自行 prefill {c.get('n_recv_bypass_false')} 次（vLLM 0.8.5 的 lookup buffer 没有“未命中”回复，"
+                     f"decode 只能等待 prefill 端的 KV，不会退回本地重算）；官方 WARNING 'Failed to receive all KVs' {ev.get('decode', {}).get('kv_fail_count')} 次")
         if s.get("agreement_with_A"):
             same = sum(x["identical"] for x in s["agreement_with_A"])
             line += f"；与 A 的贪心输出逐字一致 {same}/{len(s['agreement_with_A'])}（FP16 下不同 kernel/批次可能导致少量差异，仅作合理性参考）"
@@ -512,7 +514,7 @@ def report(cfg, runs, agg, slo, figs, include_mock):
                 kvmb = mean([x["pd"].get("kv_bytes_per_req_mean") for x in d])
                 xf = mean([x["pd"].get("transfer_ms_p50") for x in d])
                 L.append(f"- 基于 vLLM PyNcclConnector 部署真实 Prefill/Decode 分离（GPU0 prefill → NCCL 传输 KV → GPU1 decode），通过无侵入探针统计 KV 传输量与耗时"
-                         f"（实测每请求平均 {fmt((kvmb or 0) / 1e6, 1)} MB、传输中位数 {fmt(xf, 1)} ms），并用绕过 prefill 的负对照验证 decode 端未重算 prefill。")
+                         f"（实测每请求平均 {fmt((kvmb or 0) / 1e6, 1)} MB、传输中位数 {fmt(xf, 1)} ms），以 vLLM 官方 bypass_model_exec 标志、与单卡逐字一致的贪心输出、以及绕过 prefill 的负对照（decode 只等待 KV、不本地重算）验证 decode 端未重算 prefill。")
         if "C" in ok_arch:
             L.append("- 通过日志与显存证据验证 PP2 的层切分（两个 stage 各加载约一半权重），结合 TTFT/TPOT 数据分析小模型在 PCIe 互联下流水线并行的通信与气泡开销。")
         L.append("（请把上面的数字与本报告表格核对后再使用；不要写入未在表中出现的提升百分比。）")

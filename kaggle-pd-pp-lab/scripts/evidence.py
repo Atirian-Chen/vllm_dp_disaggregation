@@ -86,6 +86,7 @@ def pd_probe_stats(producer_log: str | None, consumer_log: str | None, t0: float
     cons = _window(read_jsonl(consumer_log), t0, t1) if consumer_log else []
     prod = _window(read_jsonl(producer_log), t0, t1) if producer_log else []
     sel = [r for r in cons if r.get("ev") == "select"]
+    sel_begin = [r for r in cons if r.get("ev") == "select_begin"]
     hits = [r for r in sel if r.get("hit")]
     rb = [r for r in cons if r.get("ev") == "recv_batch"]
     ins = [r for r in prod if r.get("ev") == "insert"]
@@ -101,6 +102,7 @@ def pd_probe_stats(producer_log: str | None, consumer_log: str | None, t0: float
     total_ms = sum(sel_ms)
     return {
         "n_select": len(sel), "n_select_hit": len(hits), "n_select_miss": len(sel) - len(hits),
+        "n_select_begin": len(sel_begin), "n_select_pending": max(0, len(sel_begin) - len(sel)),
         "n_recv_batches": len(rb), "n_recv_bypass_true": sum(1 for r in rb if r.get("bypass_model_exec")),
         "n_recv_bypass_false": sum(1 for r in rb if not r.get("bypass_model_exec")),
         "n_producer_inserts": len(ins), "producer_send_batch_ms_mean": r3(mean([r["ms"] for r in sb])),

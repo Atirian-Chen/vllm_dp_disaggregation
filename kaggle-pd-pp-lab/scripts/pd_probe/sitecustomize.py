@@ -6,7 +6,9 @@ It does NOT change vLLM behaviour: it wraps four methods of vLLM 0.8.5's
 $PDLAB_PROBE_LOG:
 
   producer:  send_batch (gather KV from paged cache + enqueue), insert (bytes enqueued)
-  consumer:  select     (blocking fetch of one request's KV+hidden over PyNccl, incl. signalling)
+  consumer:  select_begin (logged when a select starts; one without a matching select is
+                        still waiting for KV)
+             select     (blocking fetch of one request's KV+hidden over PyNccl, incl. signalling)
              recv_batch (all selects + writing KV into the paged cache) with the official
                         `bypass_model_exec` flag: True means the decode instance skipped the
                         prefill forward pass and used the transferred KV/hidden states.
@@ -77,6 +79,9 @@ if _LOG or _KVFIX:
                 return []
 
         def select(self, input_tokens, roi):
+            # logged before the call: in 0.8.5 a select for KV that was never produced blocks
+            # (the producer waits for a match instead of answering "miss"), so it never returns
+            _safe(lambda: {"ev": "select_begin", "n_tokens": int(input_tokens.numel())})
             t0 = time.perf_counter()
             ret = o_select(self, input_tokens, roi)
             _sync()

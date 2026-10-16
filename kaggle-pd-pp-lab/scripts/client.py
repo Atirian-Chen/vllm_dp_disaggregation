@@ -82,7 +82,7 @@ async def one_request(session: aiohttp.ClientSession, url: str, model: str, item
                     "chunks_eq_tokens": len(chunk_times) == n_out, "text": text})
     except Exception as e:
         rec.update({"ok": False, "http_status": status, "error": f"{type(e).__name__}: {e}"[:500],
-                    "e2e_ms": round((time.perf_counter() - t0) * 1000, 3)})
+                    "n_token_events": len(chunk_times), "e2e_ms": round((time.perf_counter() - t0) * 1000, 3)})
     rec["t_end_epoch"] = time.time()
     return rec
 

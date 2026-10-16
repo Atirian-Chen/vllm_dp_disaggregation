@@ -89,6 +89,12 @@ def test_probe():
         from evidence import pd_probe_stats
         st = pd_probe_stats(None, str(log), 0, 1e12)
         assert st["n_select_hit"] == 2 and st["n_select_miss"] == 2 and st["n_recv_bypass_false"] == 1
+        assert st["n_select_begin"] == 4 and st["n_select_pending"] == 0, st
+        # a select that never returns (0.8.5: KV that was never produced) shows up as pending
+        with open(log, "a") as f:
+            f.write(json.dumps({"ev": "select_begin", "n_tokens": 128, "ts": 2e12}) + "\n")
+        st2 = pd_probe_stats(None, str(log), 1.5e12, 3e12)
+        assert st2["n_select_pending"] == 1 and st2["n_select"] == 0 and st2["n_recv_bypass_false"] == 0, st2
         assert st["kv_bytes_per_token"] == 28672.0, st
     print("test_probe OK")
 
